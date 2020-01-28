@@ -25,7 +25,13 @@ func (c *chanserv) invite(ch string) (string, error) {
 		return "", errors.New("channel not found")
 	}
 
-	return "", nil
+	r := c.DB[ch]
+	invite, err := r.Invite()
+	if err != nil {
+		return "", err
+	}
+
+	return string(invite), nil
 }
 
 func (c *chanserv) accept(token string) (string, error) {

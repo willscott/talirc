@@ -1,6 +1,7 @@
 package services
 
 import (
+	"encoding/json"
 	"errors"
 	"reflect"
 
@@ -11,6 +12,7 @@ type roomAction byte
 
 const (
 	participantAdd roomAction = iota
+	participantInvite
 	participantRemove
 	postMsg
 	cancelWatch
@@ -29,11 +31,88 @@ type roomMsg struct {
 }
 
 type room struct {
+	// Participants is all other participants
 	Participants []participant
 	Log          chan roomMsg
+	nickname     string
 
+	// Outstanding invite to respond to.
+	invite *libtalek.Topic
+	// Pending sent invites waiting for response.
+	pending []participant
+	// My topic for publishing to.
 	topic   *libtalek.Topic
 	control chan roomCommand
+}
+
+func (r *room) UnmarshalJSON(data []byte) error {
+	var vals map[string]json.RawMessage
+	if err := json.Unmarshal(data, &vals); err != nil {
+		return err
+	}
+	if t, ok := vals["topic"]; ok {
+		// Full room serialized.
+		var topic libtalek.Topic
+		if err := json.Unmarshal(t, &topic); err != nil {
+			return err
+		}
+		r.topic = &topic
+		if h, ok := vals["pending"]; ok {
+			if err := json.Unmarshal(h, &r.pending); err != nil {
+				return err
+			}
+		}
+		if n, ok := vals["nickname"]; ok {
+			r.nickname = string(n)
+		}
+		if p, ok := vals["participants"]; ok {
+			return json.Unmarshal(p, &r.Participants)
+		}
+		return nil
+	} else if i, ok := vals["invite"]; ok {
+		// Invite
+		t, err := libtalek.NewTopic()
+		if err != nil {
+			return err
+		}
+		r.topic = t
+		var invite libtalek.Topic
+		if err := json.Unmarshal(i, &invite); err != nil {
+			return err
+		}
+		r.invite = &invite
+
+		if p, ok := vals["participants"]; ok {
+			return json.Unmarshal(p, &r.Participants)
+		}
+		return nil
+	}
+
+	return &json.InvalidUnmarshalError{Type: reflect.TypeOf(r)}
+}
+
+func (r *room) MarshalJSON() ([]byte, error) {
+	var m map[string]interface{}
+	m["participants"] = r.Participants
+	m["pending"] = r.pending
+	m["nickname"] = r.nickname
+	m["topic"] = r.topic
+	return json.Marshal(m)
+}
+
+func (r *room) Invite() ([]byte, error) {
+	invite, err := libtalek.NewTopic()
+	if err != nil {
+		return nil, err
+	}
+	initialTopic, err := invite.MarshalText()
+	if err != nil {
+		return nil, err
+	}
+
+	r.control <- roomCommand{participantInvite, initialTopic, nil}
+
+	return initialTopic, nil
 }
 
 func (r *room) postMsg(msg string) error {
@@ -52,13 +131,7 @@ func (r *room) watch(client *libtalek.Client) error {
 	}
 	r.control = make(chan roomCommand, 1)
 
-	cases := make([]reflect.SelectCase, 1)
-	cases[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(r.control)}
-	for _, p := range r.Participants {
-		incoming := client.Poll(p.Handle)
-		p.selector = &reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(incoming)}
-		cases = append(cases, *p.selector)
-	}
+	cases := r.generateSelectors(client)
 
 	for {
 		chosen, val, ok := reflect.Select(cases)
@@ -66,6 +139,9 @@ func (r *room) watch(client *libtalek.Client) error {
 			unwrapped, _ := val.Interface().(roomCommand)
 			if unwrapped.action == cancelWatch {
 				for _, p := range r.Participants {
+					client.Done(p.Handle)
+				}
+				for _, p := range r.pending {
 					client.Done(p.Handle)
 				}
 				return nil
@@ -76,18 +152,20 @@ func (r *room) watch(client *libtalek.Client) error {
 				}
 			} else if unwrapped.action == participantAdd {
 				r.Participants = append(r.Participants, *unwrapped.participant)
-				incoming := client.Poll(unwrapped.participant.Handle)
-				unwrapped.participant.selector = &reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(incoming)}
-				cases = append(cases, *unwrapped.participant.selector)
+				cases = r.generateSelectors(client)
+			} else if unwrapped.action == participantInvite {
+				t := new(libtalek.Topic)
+				json.Unmarshal(unwrapped.msg, t)
+				client.Publish(t, r.generateInvite(unwrapped.msg))
+
+				r.pending = append(r.pending, participant{&t.Handle, "", nil})
+				cases = r.generateSelectors(client)
 			} else { // remove.
-				for i := 0; i < len(cases); i++ {
-					if cases[i].Chan == unwrapped.participant.selector.Chan {
-						cases = append(cases[0:i], cases[i+1:]...)
-					}
-				}
 				client.Done(unwrapped.participant.Handle)
+				r.removeParticipant(unwrapped.participant)
+				cases = r.generateSelectors(client)
 			}
-		} else {
+		} else { // receive a message (either from current participant or pending)
 			for _, p := range r.Participants {
 				if *p.selector == cases[chosen] {
 					r.onMsg(&p, val.Bytes())
@@ -114,6 +192,48 @@ func (r *room) unwatch() error {
 
 // Methods below this line are called internally within the room.
 func (r *room) onMsg(from *participant, msg []byte) {
-	// TOOD: is it a notification of membership change.
+	// TODO: is it a notification of membership change.
 	r.Log <- roomMsg{msg, nil, from}
+}
+
+func (r *room) generateInvite(topic []byte) []byte {
+	var m map[string]interface{}
+	// todo: add self as a participant.
+	m["participants"] = r.Participants
+	m["invite"] = topic
+	invite, err := json.Marshal(m)
+	if err != nil {
+		return nil
+	}
+
+	return invite
+}
+
+func (r *room) generateSelectors(client *libtalek.Client) []reflect.SelectCase {
+	cases := make([]reflect.SelectCase, 1)
+	cases[0] = reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(r.control)}
+	for _, p := range r.Participants {
+		if p.selector == nil {
+			incoming := client.Poll(p.Handle)
+			p.selector = &reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(incoming)}
+		}
+		cases = append(cases, *p.selector)
+	}
+	for _, p := range r.pending {
+		if p.selector == nil {
+			incoming := client.Poll(p.Handle)
+			p.selector = &reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(incoming)}
+		}
+		cases = append(cases, *p.selector)
+	}
+	return cases
+}
+
+func (r *room) removeParticipant(item *participant) {
+	for i, other := range r.Participants {
+		if other == *item {
+			r.Participants = append(r.Participants[:i], r.Participants[i+1:]...)
+			return
+		}
+	}
 }
